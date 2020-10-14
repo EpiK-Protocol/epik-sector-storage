@@ -34,14 +34,22 @@ type SectorMgr struct {
 
 type mockVerif struct{}
 
-func NewMockSectorMgr(ssize abi.SectorSize) *SectorMgr {
+func NewMockSectorMgr(ssize abi.SectorSize, genesisSectors []abi.SectorID) *SectorMgr {
 	rt, err := ffiwrapper.SealProofTypeFromSectorSize(ssize)
 	if err != nil {
 		panic(err)
 	}
 
+	sectors := make(map[abi.SectorID]*sectorState)
+	for _, sid := range genesisSectors {
+		sectors[sid] = &sectorState{
+			failed: false,
+			state:  stateCommit,
+		}
+	}
+
 	return &SectorMgr{
-		sectors:      make(map[abi.SectorID]*sectorState),
+		sectors:      sectors,
 		pieces:       map[cid.Cid][]byte{},
 		sectorSize:   ssize,
 		nextSectorID: 5,
@@ -229,7 +237,7 @@ func (mgr *SectorMgr) SealCommit2(ctx context.Context, sid abi.SectorID, phase1O
 
 // Test Instrumentation Methods
 
-func (mgr *SectorMgr) FailSector(sid abi.SectorID) error {
+func (mgr *SectorMgr) MarkFailed(sid abi.SectorID, failed bool) error {
 	mgr.lk.Lock()
 	defer mgr.lk.Unlock()
 	ss, ok := mgr.sectors[sid]
@@ -237,7 +245,7 @@ func (mgr *SectorMgr) FailSector(sid abi.SectorID) error {
 		return fmt.Errorf("no such sector in storage")
 	}
 
-	ss.failed = true
+	ss.failed = failed
 	return nil
 }
 
@@ -262,6 +270,30 @@ func (mgr *SectorMgr) GenerateWinningPoSt(ctx context.Context, minerID abi.Actor
 }
 
 func (mgr *SectorMgr) GenerateWindowPoSt(ctx context.Context, minerID abi.ActorID, sectorInfo []abi.SectorInfo, randomness abi.PoStRandomness) ([]abi.PoStProof, []abi.SectorID, error) {
+	si := make([]abi.SectorInfo, 0, len(sectorInfo))
+	var skipped []abi.SectorID
+
+	var err error
+
+	for _, info := range sectorInfo {
+		sid := abi.SectorID{
+			Miner:  minerID,
+			Number: info.SectorNumber,
+		}
+
+		_, found := mgr.sectors[sid]
+
+		if found && !mgr.sectors[sid].failed {
+			si = append(si, info)
+		} else {
+			skipped = append(skipped, sid)
+			err = xerrors.Errorf("skipped some sectors")
+		}
+	}
+
+	if err != nil {
+		return nil, skipped, err
+	}
 	return generateFakePoSt(sectorInfo, abi.RegisteredSealProof.RegisteredWindowPoStProof), nil, nil
 }
 
@@ -335,8 +367,20 @@ func (mgr *SectorMgr) Remove(ctx context.Context, sector abi.SectorID) error {
 	return nil
 }
 
-func (mgr *SectorMgr) CheckProvable(context.Context, abi.RegisteredSealProof, []abi.SectorID) ([]abi.SectorID, error) {
-	return nil, nil
+func (mgr *SectorMgr) CheckProvable(ctx context.Context, spt abi.RegisteredSealProof, ids []abi.SectorID) ([]abi.SectorID, error) {
+	var bad []abi.SectorID
+
+	for _, sid := range ids {
+		_, found := mgr.sectors[sid]
+
+		if !found || mgr.sectors[sid].failed {
+			bad = append(bad, sid)
+		}
+	}
+	if len(bad) > 0 {
+		fmt.Printf("bad sectors found: %v\n", bad)
+	}
+	return bad, nil
 }
 
 func (m mockVerif) VerifySeal(svi abi.SealVerifyInfo) (bool, error) {
